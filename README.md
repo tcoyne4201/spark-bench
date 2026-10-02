@@ -19,16 +19,18 @@ Env overrides: `MODEL` (default `Qwen/Qwen3.8-27B-FP8`; BF16 = `Qwen/Qwen3.8-27B
 Server log: `results/server.log`. If vLLM rejects a flag, edit `deploy/serve_vllm.sh` and note the change.
 
 ## Get the data off (before destroying the instance)
-At the end the script prints the exact command; it is:
+At the end the script prints the exact `scp` command. Or, from this repo on your laptop:
 ```bash
-scp -P <port> root@<ip>:<path>/results/bench-results-vllm-*.tar.gz .
-scp -P <port> root@<ip>:<path>/results/server.log .
+make fetch HOST=<ip> PORT=<ssh-port>        # rsyncs results/*.tar.gz + server.log into fetched/
 ```
+(`REMOTE_DIR` defaults to `/root/spark-bench`; override if you cloned elsewhere.)
 
 ## Report (local)
 ```bash
-uv run report.py bench-results-vllm-*.tar.gz     # -> report/report.md + PNGs
+make report                                  # -> report/report.html, open in a browser
+# or: uv run report.py fetched/bench-results-vllm-*.tar.gz
 ```
+Interactive Plotly charts (hover/zoom/toggle), per-scenario tables and a telemetry timeline, in one offline file.
 Pass several tarballs (e.g. a llama.cpp run via `deploy/serve_llamacpp.sh` and `--stack llamacpp --base-url http://localhost:8080`) to compare stacks.
 
 ## Notes

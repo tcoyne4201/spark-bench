@@ -1,5 +1,6 @@
 results/
 report/
+fetched/
 __pycache__/
 .venv/
 .DS_Store

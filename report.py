@@ -1,11 +1,11 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pandas", "matplotlib"]
+# dependencies = ["pandas", "plotly"]
 # ///
-"""Turn bench results into report.md + PNG charts.
+"""Turn bench results into one self-contained, interactive report/report.html.
 
-    uv run report.py results/                      # dir containing <stack>/ subdirs
-    uv run report.py bench-results-*.tar.gz        # one or more tarballs (compares stacks)
+    uv run report.py fetched/*.tar.gz              # one or more tarballs (several stacks are compared)
+    uv run report.py results/                      # or a dir containing <stack>/ subdirs
 """
 import json
 import sys
@@ -13,11 +13,23 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+CHARTS = [  # scenario, x, y columns, title, y label
+    ("sweep", "concurrency", ["out_tok_s"], "Throughput vs concurrency", "output tokens/s"),
+    ("sweep", "concurrency", ["ttft_p50", "ttft_p95", "ttft_p99"], "Time to first token vs concurrency", "seconds"),
+    ("sweep", "concurrency", ["tpot_p50", "tpot_p95"], "Per-token latency vs concurrency", "seconds/token"),
+    ("sweep", "concurrency", ["errors"], "Errors vs concurrency", "failed requests"),
+    ("long_context", "context", ["ttft_p50"], "TTFT vs context length (single stream)", "seconds"),
+    ("long_context", "context", ["prefill_tok_s"], "Prefill speed vs context length", "prompt tokens/s"),
+    ("burst", "cycle", ["wall_s", "ttft_p95", "e2e_p95"], "Burst: drain time and latency per cycle", "seconds"),
+    ("thinking", "concurrency", ["time_to_answer_p50", "e2e_p50", "hit_cap_rate"], "Thinking mode", "seconds / rate"),
+]
+TELEMETRY = ["gpu_util", "power_w", "temp_c", "sm_mhz", "gpu_mem_mib", "ram_used_gb", "running", "waiting", "kv_cache"]
+TABLE_COLS = ["concurrency", "context", "cycle", "n", "ok", "errors", "wall_s", "out_tok_s", "ttft_p50", "ttft_p95",
+              "tpot_p50", "tpot_p95", "e2e_p95", "prefill_tok_s", "time_to_answer_p50", "hit_cap_rate"]
 
 
 def find_stacks(paths, tmp):
@@ -33,95 +45,82 @@ def find_stacks(paths, tmp):
     return stacks
 
 
-def md_table(df):
-    df = df.fillna("")
-    lines = ["| " + " | ".join(df.columns) + " |", "|" + "---|" * len(df.columns)]
-    lines += ["| " + " | ".join(str(v) for v in row) + " |" for row in df.itertuples(index=False)]
-    return "\n".join(lines)
-
-
-def line_chart(data, scenario, x, ys, title, ylabel, path, logx=False):
-    """One line per (stack, y column) from summary rows of one scenario."""
-    fig, ax = plt.subplots(figsize=(7, 4))
-    drawn = False
+def line_chart(data, scenario, x, ys, title, ylabel):
+    """One line per (stack, column) from the summary rows of one scenario; None if no data."""
+    fig = go.Figure()
     for stack, df in data.items():
-        d = df[df.scenario == scenario].sort_values(x)
+        d = df[df.scenario == scenario]
+        if x not in d:
+            continue
+        d = d.sort_values(x)
         for y in ys:
             if y in d and d[y].notna().any():
-                ax.plot(d[x], d[y], marker="o", label=f"{stack} {y}")
-                drawn = True
-    if drawn:
-        ax.set(title=title, xlabel=x, ylabel=ylabel)
-        if logx:
-            ax.set_xscale("log", base=2)
-        ax.grid(alpha=0.3)
-        ax.legend()
-        fig.savefig(path, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return drawn
+                fig.add_trace(go.Scatter(x=d[x], y=d[y], mode="lines+markers", name=f"{stack} {y}"))
+    if not fig.data:
+        return None
+    fig.update_layout(title=title, xaxis_title=x, yaxis_title=ylabel, height=380, margin=dict(t=50, b=40))
+    if x in ("concurrency", "context"):
+        fig.update_xaxes(type="log", dtick=0.30103)  # log2 steps
+    return fig
 
 
-def telemetry_chart(stack, d, path):
+def telemetry_chart(stack, d):
     f = d / "telemetry.csv"
     if not f.exists():
-        return False
+        return None
     t = pd.read_csv(f).apply(pd.to_numeric, errors="coerce")
-    cols = [c for c in ("gpu_util", "power_w", "temp_c", "running", "waiting", "kv_cache") if t[c].notna().any()]
+    cols = [c for c in TELEMETRY if c in t and t[c].notna().any()]
     if not cols:
-        return False
-    fig, axes = plt.subplots(len(cols), 1, figsize=(8, 1.6 * len(cols)), sharex=True)
-    for ax, c in zip([axes] if len(cols) == 1 else axes, cols):
-        ax.plot(t["t"], t[c])
-        ax.set_ylabel(c)
-        ax.grid(alpha=0.3)
-    axes[-1].set_xlabel("seconds since start") if len(cols) > 1 else None
-    fig.suptitle(f"telemetry: {stack}")
-    fig.savefig(path, dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    return True
+        return None
+    fig = make_subplots(rows=len(cols), cols=1, shared_xaxes=True, subplot_titles=cols, vertical_spacing=0.03)
+    for i, c in enumerate(cols, start=1):
+        fig.add_trace(go.Scatter(x=t["t"], y=t[c], name=c, showlegend=False), row=i, col=1)
+    fig.update_xaxes(title_text="seconds since start", row=len(cols), col=1)
+    fig.update_layout(title=f"Telemetry: {stack}", height=170 * len(cols) + 80, margin=dict(t=60, b=40))
+    return fig
 
 
 def env_line(d):
-    env = json.loads((d / "env.json").read_text()) if (d / "env.json").exists() else {}
-    return f"GPU: {env.get('gpu', '?')} | machine: {env.get('machine', '?')} | RAM {env.get('ram_gb', '?')} GB | run at {env.get('time', '?')}"
+    f = d / "env.json"
+    env = json.loads(f.read_text()) if f.exists() else {}
+    return (f"GPU: {env.get('gpu') or '?'} | {env.get('machine', '?')} | RAM {env.get('ram_gb', '?')} GB | "
+            f"run at {env.get('time', '?')} | server: {env.get('server_version') or '?'}")
+
+
+def table_html(g):
+    cols = [c for c in TABLE_COLS if c in g and g[c].notna().any()]
+    return g[cols].to_html(index=False, na_rep="", border=0, classes="t")
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    tmp = tempfile.mkdtemp()
-    stacks = find_stacks(sys.argv[1:], tmp)
+    stacks = find_stacks(sys.argv[1:], tempfile.mkdtemp())
     if not stacks:
         sys.exit("no summary.json found")
-    out = Path("report")
-    out.mkdir(exist_ok=True)
     data = {s: pd.DataFrame(json.loads((d / "summary.json").read_text())) for s, d in stacks.items()}
 
-    charts = [
-        ("sweep", "concurrency", ["out_tok_s"], "Throughput vs concurrency", "output tokens/s", "throughput.png", True),
-        ("sweep", "concurrency", ["ttft_p50", "ttft_p95", "ttft_p99"], "TTFT vs concurrency", "seconds", "ttft.png", True),
-        ("sweep", "concurrency", ["tpot_p50", "tpot_p95"], "Per-token latency vs concurrency", "seconds/token", "tpot.png", True),
-        ("long_context", "context", ["ttft_p50"], "TTFT vs context length (single stream)", "seconds", "ctx_ttft.png", True),
-        ("long_context", "context", ["prefill_tok_s"], "Prefill speed vs context length", "prompt tokens/s", "ctx_prefill.png", True),
-    ]
-    md = ["# DGX Spark benchmark report", ""]
-    for s, d in stacks.items():
-        md.append(f"- **{s}**: {env_line(d)}")
-    for scenario, x, ys, title, ylabel, fname, logx in charts:
-        if line_chart(data, scenario, x, ys, title, ylabel, out / fname, logx):
-            md += ["", f"![{title}]({fname})"]
-    for s, d in stacks.items():
-        if telemetry_chart(s, d, out / f"telemetry_{s}.png"):
-            md += ["", f"![telemetry {s}](telemetry_{s}.png)"]
+    figs = [line_chart(data, *c) for c in CHARTS]
+    figs += [telemetry_chart(s, d) for s, d in stacks.items()]
+    figs = [f for f in figs if f is not None]
 
-    show = ["concurrency", "context", "n", "ok", "errors", "wall_s", "out_tok_s", "ttft_p50", "ttft_p95",
-            "tpot_p50", "tpot_p95", "e2e_p95", "prefill_tok_s", "time_to_answer_p50", "hit_cap_rate"]
+    html = ["<html><head><meta charset='utf-8'><title>Spark benchmark</title><style>"
+            "body{font-family:sans-serif;max-width:1000px;margin:2em auto}"
+            ".t{border-collapse:collapse;font-size:12px}.t td,.t th{padding:3px 8px;border-bottom:1px solid #ddd;text-align:right}"
+            "</style></head><body><h1>DGX Spark benchmark report</h1><ul>"]
+    html += [f"<li><b>{s}</b>: {env_line(d)}</li>" for s, d in stacks.items()]
+    html.append("</ul>")
+    for i, fig in enumerate(figs):  # plotly.js embedded once so the file works offline
+        html.append(fig.to_html(full_html=False, include_plotlyjs=True if i == 0 else False))
     for s, df in data.items():
         for scenario, g in df.groupby("scenario", sort=False):
-            cols = [c for c in show if c in g and g[c].notna().any()]
-            md += ["", f"## {s}: {scenario}", "", md_table(g[cols])]
-    (out / "report.md").write_text("\n".join(md) + "\n")
-    print(f"wrote {out / 'report.md'}")
+            html.append(f"<h2>{s}: {scenario}</h2>{table_html(g)}")
+    html.append("</body></html>")
+
+    out = Path("report")
+    out.mkdir(exist_ok=True)
+    (out / "report.html").write_text("\n".join(html))
+    print(f"wrote {out / 'report.html'}  (open it in a browser)")
 
 
 if __name__ == "__main__":
