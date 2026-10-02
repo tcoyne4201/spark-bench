@@ -15,11 +15,28 @@ export PATH="$HOME/.local/bin:$PATH"
 echo ">> downloading $MODEL"
 uvx --from huggingface_hub hf download "$MODEL"
 
-if curl -sf "localhost:$PORT/v1/models" >/dev/null; then
-  echo ">> server already running"
+# Only reuse a server WE started (pid file). Any other vllm (e.g. the image's own default server)
+# has unknown flags and holds GPU memory, so refuse, or kill it with KILL_EXISTING=1.
+our_pid=$(cat results/server.pid 2>/dev/null || true)
+others=$(pgrep -f 'vllm serve' | grep -vx "${our_pid:-0}" || true)
+if [ -n "$others" ]; then
+  if [ "${KILL_EXISTING:-0}" = 1 ]; then
+    echo ">> killing other vllm processes: $others"
+    pkill -f 'vllm' || true
+    sleep 10
+  else
+    echo "ERROR: another vllm server is running (pid $others), likely the image's default." >&2
+    echo "Kill it (pkill -f vllm) or re-run with KILL_EXISTING=1. It would compete for memory." >&2
+    exit 1
+  fi
+fi
+
+if [ -n "$our_pid" ] && kill -0 "$our_pid" 2>/dev/null; then
+  echo ">> our server already running (pid $our_pid)"
 elif command -v vllm >/dev/null; then
   echo ">> starting vllm on host (log: results/server.log)"
-  nohup ./deploy/serve_vllm.sh > results/server.log 2>&1 &
+  nohup bash ./deploy/serve_vllm.sh > results/server.log 2>&1 &
+  echo $! > results/server.pid
 else
   : "${VLLM_IMAGE:?vllm not installed: set VLLM_IMAGE to a vLLM docker image that supports the Spark (GB10)}"
   echo ">> starting vllm in docker ($VLLM_IMAGE)"
